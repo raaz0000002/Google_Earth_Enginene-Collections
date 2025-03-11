@@ -1,0 +1,171 @@
+var imagery = ee
+  .ImageCollection("COPERNICUS/S2_HARMONIZED")
+  .filterDate("2023-10-01", "2023-12-30")
+  .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20)) // Less cloudy granules
+  .filterBounds(aoi)
+  .map(maskS2clouds)
+  .map(function (img) {
+    return img.clip(aoi);
+  })
+  .median();
+
+imagery = selectBands(imagery);
+print(imagery);
+
+// Visualization
+Map.addLayer(imagery, imageVisParam, "dataset_rgbviz", true);
+
+// Variables
+var palette = ["#416422", "#819A20", "#FF0000", "#808080"]; // Corrected HEX codes
+var classes = [1, 2, 3, 4];
+var classNames = ["Vegetation", "Cultivation", "Urban", "Bare"];
+
+var bands = ["B4", "B3", "B2", "B8", "B11", "B12", "NDVI", "NDBI", "MNDWI", "NDSLI"];
+var columns = ["B4", "B3", "B2", "B8", "B11", "B12", "NDVI", "NDBI", "MNDWI", "NDSLI", "class", "sample"];
+
+//===================================================
+// Machine Learning Model
+//===================================================
+// Merge samples and ensure valid FeatureCollection
+var samples = Vegetation
+  .merge(Cultivation)
+  .merge(Urban)
+  .merge(Bare)
+  .map(function (feat) {
+    return ee.Feature(feat.geometry().buffer(2, ee.ErrorMargin(1)), feat.toDictionary()); // Retain properties
+  });
+
+
+samples = ee.FeatureCollection(
+  classes.map(function (value) {
+    var features = samples
+      .filter(ee.Filter.eq("class", value))
+      .randomColumn("random"); // Explicitly specify column name
+
+    var train = features.filter(ee.Filter.lte("random", 0.85))
+                        .map(function (feat) { return feat.set("sample", "train"); });
+
+    var test = features.filter(ee.Filter.gt("random", 0.85))
+                       .map(function (feat) { return feat.set("sample", "test"); });
+
+    return train.merge(test);
+  })
+).flatten();
+
+
+
+// Extract sample values
+var extractedSample = imagery.sampleRegions({
+  collection: samples,
+  scale: 10,
+  properties: ["sample", "class"],
+});
+
+// Train-test split
+var trainSample = extractedSample.filter(ee.Filter.eq("sample", "train"));
+print("Train sample size", trainSample.size());
+var testSample = extractedSample.filter(ee.Filter.eq("sample", "test"));
+print("Test sample size", testSample.size());
+
+Export.table.toDrive({
+  collection: extractedSample,
+  fileFormat: "CSV",
+  selectors: columns,
+  description: "lulc_samples",
+  folder: "DL",
+});
+
+// Export imagery
+Export.image.toDrive({
+  image: imagery.toFloat(),
+  scale: 10,
+  maxPixels: 1e13,
+  region: aoi,
+  crs: "EPSG:4326", // Corrected CRS string syntax
+  folder: "DL",
+  description: "s2_pokhara",
+});
+
+// Legend dictionary
+var legend = {
+  LULC_class_values: [1, 2, 3, 4],
+  LULC_class_palette: ["#416422", "#819A20", "#FF0000", "#808080"], // Corrected HEX codes
+};
+
+// Train Random Forest model
+var rf_model = ee.Classifier.smileRandomForest(300).train(trainSample, "class", bands);
+
+// Model accuracy test
+var cm = testSample.classify(rf_model, "predict").errorMatrix("class", "predict");
+print("Confusion matrix", cm, "Accuracy", cm.accuracy(), "Kappa", cm.kappa());
+
+var lulc = imagery.classify(rf_model, "LULC").toByte();
+Map.addLayer(lulc, { min: 1, max: 4, palette: palette }, "LULC", false);
+
+//==================================================
+// Function to add indices and select bands
+//==================================================
+function selectBands(image) {
+  var ndvi = image.expression("(NIR - RED) / (NIR + RED)", {
+    NIR: image.select("B8"),
+    RED: image.select("B4"),
+  }).rename("NDVI");
+
+  var ndbi = image.expression("(SWIR - NIR) / (SWIR + NIR)", {
+    NIR: image.select("B8"),
+    SWIR: image.select("B11"),
+  }).rename("NDBI");
+
+  var mndwi = image.expression("(GREEN - SWIR1) / (GREEN + SWIR1)", {
+    GREEN: image.select("B3"),
+    SWIR1: image.select("B11"),
+  }).rename("MNDWI");
+
+  var ndsli = image.expression("(RED - SWIR1) / (RED + SWIR1)", {
+    RED: image.select("B4"),
+    SWIR1: image.select("B11"),
+  }).rename("NDSLI");
+
+  var bands = ["B4", "B3", "B2", "B8", "B11", "B12"];
+  return image.select(bands).addBands([ndvi, mndwi, ndbi, ndsli]);
+}
+
+//==================================================
+// Legend UI
+//==================================================
+var legendPanel = ui.Panel({
+  style: { position: "bottom-left", padding: "8px 15px" },
+});
+
+legendPanel.add(ui.Label({
+  value: "LULC Legend",
+  style: { fontWeight: "bold", fontSize: "18px", margin: "0 0 4px 0", padding: "0" },
+}));
+
+function makeLegendRow(color, name) {
+  return ui.Panel({
+    widgets: [
+      ui.Label({ style: { backgroundColor: color, padding: "8px", margin: "0 0 4px 0" } }),
+      ui.Label({ value: name, style: { margin: "0 0 4px 6px" } }),
+    ],
+    layout: ui.Panel.Layout.Flow("horizontal"),
+  });
+}
+
+// Add legend items
+for (var i = 0; i < classNames.length; i++) {
+  legendPanel.add(makeLegendRow(palette[i], classNames[i]));
+}
+
+Map.add(legendPanel);
+
+//==================================================
+// Cloud Masking Function
+//==================================================
+function maskS2clouds(image) {
+  var qa = image.select("QA60");
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
